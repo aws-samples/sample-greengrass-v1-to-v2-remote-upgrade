@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Static cloud prerequisites for the Greengrass V1 -> V2 remote upgrade sample.
+  Deploy ONCE per account/region before touching any device.
+
+  Stack name used: gg-v1v2-upgrade-prereqs
+
+Parameters:
+  TokenExchangeRoleName:
+    Type: String
+    Default: GreengrassV2TokenExchangeRole
+    Description: >-
+      IAM role the V2 nucleus assumes (via the IoT credentials provider) to
+      call AWS services. The default matches the name AWS documentation uses,
+      so consoles/docs line up with what readers see elsewhere.
+  TokenExchangeRoleAliasName:
+    Type: String
+    Default: GreengrassCoreTokenExchangeRoleAlias
+    Description: >-
+      IoT role alias that points device certificates at the token exchange
+      role. Referenced by name in the V2 config.yaml the upgrade writes.
+  UpgradedThingGroupName:
+    Type: String
+    Default: GreengrassV2_UpgradedFromV1
+    Description: >-
+      Thing group for upgraded core devices. V2 deployments target this group;
+      add each device after its upgrade is verified.
+  CoreDeviceThingName:
+    Type: String
+    Default: gg-v1-demo-Core
+    Description: >-
+      Thing name of the core device (the V1 thing name, which V2 reuses)
+
+Resources:
+  TokenExchangeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref TokenExchangeRoleName
+      Description: Assumed by Greengrass V2 core devices via the IoT credentials provider.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: credentials.iot.amazonaws.com
+            Action: sts:AssumeRole
+              # Confused-deputy guard: only role aliases in THIS account may
+              # route the IoT credentials provider to this role
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:rolealias/*
+      Policies:
+        - PolicyName: GreengrassV2TokenExchangeRoleAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Nucleus + log manager write device logs to CloudWatch. Scoped
+              # to the /aws/greengrass/* log groups the nucleus creates.
+              - Sid: GreengrassCloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/greengrass/*
+              # s3:GetBucketLocation doesn't support resource-level scoping in
+              # a useful way for buckets the device may need to resolve; the
+              # AWS-managed GreengrassV2TokenExchangeRoleAccess policy also
+              # grants it on *. If you mirror the installer or host component
+              # artifacts in S3, additionally grant s3:GetObject on that bucket.
+              - Sid: GreengrassS3BucketLocation
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: "*"
+
+  TokenExchangeRoleAlias:
+    Type: AWS::IoT::RoleAlias
+    Properties:
+      RoleAlias: !Ref TokenExchangeRoleAliasName
+      RoleArn: !GetAtt TokenExchangeRole.Arn
+      CredentialDurationSeconds: 3600
+
+  # ---------------------------------------------------------------------------
+  # IoT policies attached to the EXISTING V1 device certificate so the same 
+  # certificate works for V2. Split in two on purpose: one is the V2 data-plane 
+  # policy, the other is the single extra permission (AssumeRoleWithCertificate) 
+  # that token exchange needs. Keeping them separate makes teardown and auditing 
+  # unambiguous.
+  # ---------------------------------------------------------------------------
+  TesCertificatePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: GreengrassTESCertificatePolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: iot:AssumeRoleWithCertificate
+            Resource: !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:rolealias/${TokenExchangeRoleAliasName}
+
+  # Minimal V2 core-device data-plane policy, following the documented pattern at
+  # https://docs.aws.amazon.com/greengrass/v2/developerguide/device-auth.html
+  # Notes:
+  #  - The thing name is a template PARAMETER, not an IoT policy variable:
+  #    AWS documents that iot:Connection.Thing.* variables are NOT supported
+  #    for Greengrass core devices / data-plane operations
+  #  - client/<thing>* : the trailing * on the CLIENT ID is REQUIRED. Past 50
+  #    concurrent subscriptions the nucleus opens extra connections with
+  #    client IDs like "<thing>#2"; exact-match causes later disconnects.
+  #    Topic ARNs use the plain thing name
+  #  - greengrass:* actions on Resource:* : these four data-plane actions do
+  #    not support resource-level permissions (documented AWS limitation)
+  ThingPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: GreengrassV2IoTThingPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Connect
+            Effect: Allow
+            Action: iot:Connect
+            Resource: !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:client/${CoreDeviceThingName}*
+          - Sid: PublishReceive
+            Effect: Allow
+            Action:
+              - iot:Publish
+              - iot:Receive
+            Resource:
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${CoreDeviceThingName}/greengrass/health/json
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${CoreDeviceThingName}/greengrassv2/health/json
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${CoreDeviceThingName}/jobs/*
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${CoreDeviceThingName}/shadow/*
+          - Sid: Subscribe
+            Effect: Allow
+            Action: iot:Subscribe
+            Resource:
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${CoreDeviceThingName}/jobs/*
+              - !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${CoreDeviceThingName}/shadow/*
+          - Sid: GreengrassDataPlane
+            Effect: Allow
+            Action:
+              # None of these support resource-level permissions; see note above.
+              - greengrass:GetComponentVersionArtifact
+              - greengrass:ResolveComponentCandidates
+              - greengrass:GetDeploymentConfiguration
+              - greengrass:ListThingGroupsForCoreDevice
+            Resource: "*"
+
+  UpgradedThingGroup:
+    Type: AWS::IoT::ThingGroup
+    Properties:
+      ThingGroupName: !Ref UpgradedThingGroupName
+      ThingGroupProperties:
+        ThingGroupDescription: Core devices upgraded from Greengrass V1 by this sample.
+
+  # ---------------------------------------------------------------------------
+  # Execution role for the two AWS Lambda functions. The role is deliberately
+  # permissionless: these functions never execute in the AWS Lambda service.
+  # Greengrass V1 downloads the code and runs it ON the device under the
+  # core's own credentials. lambda:CreateFunction simply requires a role ARN
+  # with a lambda.amazonaws.com trust policy to exist.
+  # ---------------------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GGv1UpgradeLambdaExecutionRole
+      Description: Placeholder execution role; GGv1 group Lambdas run on-device, not in AWS Lambda.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+Outputs:
+  TokenExchangeRoleArn:
+    Description: IAM role assumed by V2 core devices via token exchange.
+    Value: !GetAtt TokenExchangeRole.Arn
+  TokenExchangeRoleAlias:
+    Description: IoT role alias name.
+    Value: !Ref TokenExchangeRoleAliasName
+  ThingPolicyName:
+    Description: V2 data-plane IoT policy to attach to each device certificate.
+    Value: !Ref ThingPolicy
+  TesCertificatePolicyName:
+    Description: Token-exchange IoT policy to attach to each device certificate.
+    Value: !Ref TesCertificatePolicy
+  UpgradedThingGroupName:
+    Description: Thing group to add devices to after a verified upgrade.
+    Value: !Ref UpgradedThingGroupName
+  LambdaExecutionRoleArn:
+    Description: Pass as the Lambda role.
+    Value: !GetAtt LambdaExecutionRole.Arn

@@ -1,0 +1,15 @@
+build/
+__pycache__/
+device-bundle/
+
+# macOS
+.DS_Store
+
+# security scans
+.protoshield
+
+# claude
+.claude/
+
+# docs
+Archive.zip

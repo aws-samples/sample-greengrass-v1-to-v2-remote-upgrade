@@ -1,0 +1,3 @@
+[submodule "greengrass-agent-context-pack"]
+	path = greengrass-agent-context-pack
+	url = https://github.com/aws-greengrass/greengrass-agent-context-pack.git
